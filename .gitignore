@@ -1,0 +1,10 @@
+__pycache__/
+.python/
+data/
+config/openai_key.txt
+api key.txt
+bitunixtraderjoeapi.txt
+*.db
+*.log
+python-*-embed-*.zip
+.env
