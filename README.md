@@ -151,6 +151,9 @@ Run an hourly loop that:
 run_auto_loop.bat
 ```
 
+Live loop now runs `paper_trade.py --rl` (online Q-learning). It writes status to:
+- `data/models/rl_status.txt`
+
 Paper trading summary:
 ```
 run_paper_summary.bat

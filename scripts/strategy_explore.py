@@ -10,6 +10,7 @@ from pathlib import Path as _Path
 sys.path.append(str((_Path(__file__).resolve().parent)))
 
 from signal_engine import build_signals
+from progress_bar import render_progress
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -37,6 +38,7 @@ def simulate_trades(
     dca_atr=1.0,
     martingale=1.5,
     max_dca=2,
+    max_leverage=1.0,
 ):
     position = None
     trades = []
@@ -92,26 +94,34 @@ def simulate_trades(
                         trigger = position["entry"] - (position["dca_steps"] + 1) * dca_atr * position["atr"]
                         if price <= trigger:
                             add = position["base_size"] * (martingale ** (position["dca_steps"] + 1))
-                            new_size = position["size"] + add
-                            position["entry"] = (position["entry"] * position["size"] + price * add) / new_size
-                            position["size"] = new_size
-                            position["dca_steps"] += 1
+                            old_size = position["size"]
+                            new_size = min(max_leverage, old_size + add)
+                            add_eff = new_size - old_size
+                            if add_eff > 0:
+                                position["entry"] = (position["entry"] * old_size + price * add_eff) / new_size
+                                position["size"] = new_size
+                                position["dca_steps"] += 1
                     else:
                         trigger = position["entry"] + (position["dca_steps"] + 1) * dca_atr * position["atr"]
                         if price >= trigger:
                             add = position["base_size"] * (martingale ** (position["dca_steps"] + 1))
-                            new_size = position["size"] + add
-                            position["entry"] = (position["entry"] * position["size"] + price * add) / new_size
-                            position["size"] = new_size
-                            position["dca_steps"] += 1
+                            old_size = position["size"]
+                            new_size = min(max_leverage, old_size + add)
+                            add_eff = new_size - old_size
+                            if add_eff > 0:
+                                position["entry"] = (position["entry"] * old_size + price * add_eff) / new_size
+                                position["size"] = new_size
+                                position["dca_steps"] += 1
 
         # signal-based transitions
         if position is None:
             if bool(row.get("buy")) and atr_val is not None:
                 base_size = 1.0 * (martingale ** loss_streak) if martingale > 1.0 else 1.0
+                base_size = min(base_size, max_leverage)
                 position = {"side": "long", "entry": price, "atr": atr_val, "size": base_size, "base_size": base_size, "dca_steps": 0, "tp1_hit": False}
             elif bool(row.get("sell")) and atr_val is not None:
                 base_size = 1.0 * (martingale ** loss_streak) if martingale > 1.0 else 1.0
+                base_size = min(base_size, max_leverage)
                 position = {"side": "short", "entry": price, "atr": atr_val, "size": base_size, "base_size": base_size, "dca_steps": 0, "tp1_hit": False}
             continue
 
@@ -124,6 +134,7 @@ def simulate_trades(
             else:
                 loss_streak += 1
             base_size = 1.0 * (martingale ** loss_streak) if martingale > 1.0 else 1.0
+            base_size = min(base_size, max_leverage)
             position = {"side": "short", "entry": price, "atr": atr_val, "size": base_size, "base_size": base_size, "dca_steps": 0, "tp1_hit": False}
         elif position["side"] == "short" and bool(row.get("buy")):
             pnl = (position["entry"] - price) / position["entry"]
@@ -134,6 +145,7 @@ def simulate_trades(
             else:
                 loss_streak += 1
             base_size = 1.0 * (martingale ** loss_streak) if martingale > 1.0 else 1.0
+            base_size = min(base_size, max_leverage)
             position = {"side": "long", "entry": price, "atr": atr_val, "size": base_size, "base_size": base_size, "dca_steps": 0, "tp1_hit": False}
 
     return trades
@@ -142,7 +154,8 @@ def simulate_trades(
 def metrics(trades):
     if not trades:
         return 0, 0.0, 0.0, 0.0, 0.0
-    arr = np.array(trades)
+    arr = np.array(trades, dtype=float)
+    arr = np.clip(arr, -0.999, 10.0)
     total = len(arr)
     win_rate = float((arr > 0).mean())
     avg = float(arr.mean())
@@ -161,6 +174,7 @@ def main():
     p.add_argument("--summary", default="data/models/strategy_explore_summary.txt")
     p.add_argument("--max-combos", type=int, default=0)
     p.add_argument("--sleep", type=float, default=0.0)
+    p.add_argument("--max-leverage", type=float, default=1.0)
     args = p.parse_args()
 
     df = pd.read_csv(args.input)
@@ -214,6 +228,7 @@ def main():
             dca_atr=dca_a,
             martingale=mg,
             max_dca=2,
+            max_leverage=min(1.0, max(0.1, float(args.max_leverage))),
         )
         trades_count, win_rate, avg, max_dd, total_ret = metrics(trades)
         # score balances return vs drawdown (no hard cap)
@@ -243,7 +258,7 @@ def main():
             import time
             time.sleep(args.sleep)
         if i % 5 == 0 or i == combo_total:
-            print(f"Progress: {i}/{combo_total} ({i/combo_total:.0%})")
+            print(f"Progress {render_progress(i, combo_total)}")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

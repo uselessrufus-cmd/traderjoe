@@ -10,6 +10,7 @@ from pathlib import Path as _Path
 sys.path.append(str((_Path(__file__).resolve().parent)))
 
 from signal_engine import build_signals
+from progress_bar import render_progress
 
 
 @dataclass
@@ -86,6 +87,11 @@ def main():
     reports = []
     i = 0
     windows = 0
+    total_windows = 0
+    if len(df) >= args.train_bars + args.test_bars:
+        total_windows = ((len(df) - args.train_bars - args.test_bars) // args.test_bars) + 1
+    if args.max_windows and total_windows > 0:
+        total_windows = min(total_windows, args.max_windows)
     while i + args.train_bars + args.test_bars <= len(df):
         train = df.iloc[i : i + args.train_bars]
         test = df.iloc[i + args.train_bars : i + args.train_bars + args.test_bars]
@@ -134,6 +140,8 @@ def main():
 
         i += args.test_bars
         windows += 1
+        if total_windows > 0:
+            print(f"Progress {render_progress(windows, total_windows)}")
         if windows >= args.max_windows:
             break
 

@@ -10,6 +10,7 @@ from pathlib import Path as _Path
 sys.path.append(str((_Path(__file__).resolve().parent)))
 
 from ml_features import build_features, label_outcomes
+from progress_bar import render_progress
 
 
 def run_windows(df, train_bars, test_bars):
@@ -67,12 +68,19 @@ def run_windows(df, train_bars, test_bars):
         return acc
 
     accs = []
+    total_windows = 0
+    if len(df) >= train_bars + test_bars:
+        total_windows = ((len(df) - train_bars - test_bars) // test_bars) + 1
     i = 0
+    widx = 0
     while i + train_bars + test_bars <= len(df):
         train = df.iloc[i : i + train_bars]
         test = df.iloc[i + train_bars : i + train_bars + test_bars]
         accs.append(train_eval(train, test))
         i += test_bars
+        widx += 1
+        if total_windows > 0 and (widx % 5 == 0 or widx == total_windows):
+            print(f"  windows {render_progress(widx, total_windows)}")
 
     if not accs:
         return None
@@ -107,12 +115,15 @@ def main():
     test_windows = [24 * 90]
 
     rows = []
-    for horizon, threshold, train_bars, test_bars in itertools.product(horizons, thresholds, train_windows, test_windows):
+    combos = list(itertools.product(horizons, thresholds, train_windows, test_windows))
+    total = len(combos)
+    for idx, (horizon, threshold, train_bars, test_bars) in enumerate(combos, start=1):
         tmp = build_features(df.copy())
         tmp = label_outcomes(tmp, horizon=horizon, threshold=threshold)
         tmp = tmp.dropna().reset_index(drop=True)
         stats = run_windows(tmp, train_bars, test_bars)
         if stats is None:
+            print(f"Progress {render_progress(idx, total)}")
             continue
         stability = stats["mean"] - stats["std"]
         rows.append({
@@ -132,6 +143,7 @@ def main():
         # Throttle to reduce CPU usage
         import time
         time.sleep(args.sleep)
+        print(f"Progress {render_progress(idx, total)}")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

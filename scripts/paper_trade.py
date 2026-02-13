@@ -3,6 +3,7 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+import random
 import sys
 from pathlib import Path as _Path
 
@@ -11,10 +12,15 @@ sys.path.append(str((_Path(__file__).resolve().parent)))
 # Simple paper trader config
 BASE_SIZE = 1.0
 ADD_SIZE = 0.5
-MAX_SIZE = 3.0
+MAX_SIZE = 1.0
 ALLOW_REVERSE = True
 MIN_SIZE_PCT = 0.2
 SIGNAL_CONF = 0.4
+RL_ALPHA = 0.2
+RL_GAMMA = 0.95
+RL_EPSILON = 0.1
+RL_WARMUP = 30
+RL_ACTIONS = ("buy", "sell", "hold")
 
 
 def get_latest_price(csv_path: Path):
@@ -43,6 +49,33 @@ def compute_position_size(csv_path: Path) -> float:
     score = max(-2.0, min(2.0, score))
     pct = (score + 2.0) / 4.0
     return float(pct)
+
+
+def compute_market_state(csv_path: Path, pos_side: str | None) -> str:
+    df = pd.read_csv(csv_path)
+    df.columns = [c.lower() for c in df.columns]
+    df = df[["close"]].dropna()
+    if len(df) < 240:
+        return f"flat|lowvol|{pos_side or 'none'}"
+
+    close = df["close"]
+    sma_fast = close.rolling(50).mean()
+    sma_slow = close.rolling(200).mean()
+    trend = "bull" if sma_fast.iloc[-1] > sma_slow.iloc[-1] else "bear"
+    ret = close.pct_change()
+    mom_raw = ret.tail(12).mean()
+    vol = ret.tail(48).std()
+    mom = 0.0 if pd.isna(mom_raw) else float(mom_raw)
+    vol_val = 0.0 if pd.isna(vol) else float(vol)
+    if mom > 0.001:
+        mom_bucket = "up"
+    elif mom < -0.001:
+        mom_bucket = "down"
+    else:
+        mom_bucket = "flat"
+    vol_bucket = "highvol" if vol_val > 0.02 else "lowvol"
+    side_bucket = pos_side if pos_side in {"long", "short"} else "none"
+    return f"{trend}:{mom_bucket}|{vol_bucket}|{side_bucket}"
 
 
 def get_signal(signal_file: Path, fallback_csv: Path):
@@ -116,6 +149,34 @@ def init_db(db_path: Path):
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rl_q (
+                state TEXT NOT NULL,
+                action TEXT NOT NULL,
+                q REAL NOT NULL DEFAULT 0,
+                updates INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (state, action)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rl_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rl_pending (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state TEXT,
+                action TEXT
+            )
+            """
+        )
         con.commit()
 
 
@@ -152,6 +213,102 @@ def record_trade(con, side, size, entry_price, entry_ts, exit_price, exit_ts):
         "INSERT INTO trades (side, size, entry_price, entry_ts, exit_price, exit_ts, pnl, pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (side, size, entry_price, entry_ts, exit_price, exit_ts, pnl, pnl_pct),
     )
+    return pnl_pct
+
+
+def _rl_get_q(con, state: str, action: str) -> float:
+    cur = con.execute("SELECT q FROM rl_q WHERE state=? AND action=?", (state, action))
+    row = cur.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def _rl_set_q(con, state: str, action: str, q_value: float):
+    con.execute(
+        """
+        INSERT INTO rl_q(state, action, q, updates)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(state, action) DO UPDATE SET
+            q=excluded.q,
+            updates=rl_q.updates + 1
+        """,
+        (state, action, q_value),
+    )
+
+
+def _rl_get_total_updates(con) -> int:
+    cur = con.execute("SELECT COALESCE(SUM(updates), 0) FROM rl_q")
+    row = cur.fetchone()
+    return int(row[0] or 0)
+
+
+def _rl_get_pending(con):
+    cur = con.execute("SELECT state, action FROM rl_pending WHERE id=1")
+    row = cur.fetchone()
+    if row:
+        return {"state": row[0], "action": row[1]}
+    return None
+
+
+def _rl_set_pending(con, state: str, action: str):
+    con.execute(
+        """
+        INSERT INTO rl_pending(id, state, action)
+        VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET state=excluded.state, action=excluded.action
+        """,
+        (state, action),
+    )
+
+
+def _rl_clear_pending(con):
+    con.execute("DELETE FROM rl_pending WHERE id=1")
+
+
+def _rl_choose_action(con, state: str, base_signal: str, epsilon: float, warmup_updates: int):
+    total_updates = _rl_get_total_updates(con)
+    if total_updates < warmup_updates:
+        return base_signal, total_updates, "warmup"
+
+    if random.random() < epsilon:
+        return random.choice(RL_ACTIONS), total_updates, "explore"
+
+    q_map = {a: _rl_get_q(con, state, a) for a in RL_ACTIONS}
+    best = max(q_map, key=lambda a: q_map[a])
+    return best, total_updates, "exploit"
+
+
+def _rl_update(con, reward: float, next_state: str):
+    pending = _rl_get_pending(con)
+    if pending is None:
+        return
+    state = pending["state"]
+    action = pending["action"]
+    current_q = _rl_get_q(con, state, action)
+    next_max = max(_rl_get_q(con, next_state, a) for a in RL_ACTIONS)
+    target = reward + RL_GAMMA * next_max
+    new_q = current_q + RL_ALPHA * (target - current_q)
+    _rl_set_q(con, state, action, new_q)
+    _rl_clear_pending(con)
+
+
+def _write_rl_status(path: Path, enabled: bool, state: str, base_signal: str, rl_signal: str, final_signal: str, mode: str, updates: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        (
+            f"enabled={enabled}\n"
+            f"state={state}\n"
+            f"base_signal={base_signal}\n"
+            f"rl_signal={rl_signal}\n"
+            f"final_signal={final_signal}\n"
+            f"mode={mode}\n"
+            f"updates={updates}\n"
+            f"alpha={RL_ALPHA}\n"
+            f"gamma={RL_GAMMA}\n"
+            f"epsilon={RL_EPSILON}\n"
+            f"warmup={RL_WARMUP}\n"
+        ),
+        encoding="ascii",
+    )
 
 
 def main():
@@ -159,6 +316,10 @@ def main():
     p.add_argument("--price", default="data/bitstamp/ohlc/bitstamp_1h.csv")
     p.add_argument("--signal", default="data/models/lgbm_latest_signal.txt")
     p.add_argument("--db", default="data/paper_trades.db")
+    p.add_argument("--rl", action="store_true")
+    p.add_argument("--epsilon", type=float, default=RL_EPSILON)
+    p.add_argument("--warmup-updates", type=int, default=RL_WARMUP)
+    p.add_argument("--rl-status", default="data/models/rl_status.txt")
     args = p.parse_args()
 
     # Load adaptive params if available
@@ -179,13 +340,22 @@ def main():
 
     price_ts, price = get_latest_price(Path(args.price))
     size_pct = compute_position_size(Path(args.price))
-    signal = get_signal(Path(args.signal), Path(args.price))
+    base_signal = get_signal(Path(args.signal), Path(args.price))
 
     db_path = Path(args.db)
     init_db(db_path)
 
     with sqlite3.connect(db_path) as con:
         pos = load_position(con)
+        state = compute_market_state(Path(args.price), pos["side"] if pos else None)
+        signal = base_signal
+        rl_signal = base_signal
+        mode = "disabled"
+        updates = _rl_get_total_updates(con)
+        if args.rl:
+            rl_signal, updates, mode = _rl_choose_action(con, state, base_signal, args.epsilon, args.warmup_updates)
+            signal = rl_signal
+        _write_rl_status(Path(args.rl_status), args.rl, state, base_signal, rl_signal, signal, mode, updates)
 
         # avoid duplicate action on same timestamp
         if pos and pos.get("last_action_ts") == price_ts:
@@ -205,6 +375,8 @@ def main():
                     "last_action_ts": price_ts,
                 }
                 save_position(con, pos)
+                if args.rl:
+                    _rl_set_pending(con, state, "buy")
                 con.commit()
                 print(f"OPEN LONG {BASE_SIZE} @ {price}")
             elif signal == "sell":
@@ -219,9 +391,13 @@ def main():
                     "last_action_ts": price_ts,
                 }
                 save_position(con, pos)
+                if args.rl:
+                    _rl_set_pending(con, state, "sell")
                 con.commit()
                 print(f"OPEN SHORT {BASE_SIZE} @ {price}")
             else:
+                if args.rl:
+                    _rl_set_pending(con, state, "hold")
                 print("HOLD (no position)")
             return
 
@@ -230,6 +406,8 @@ def main():
         if signal == "hold":
             pos["last_action_ts"] = price_ts
             save_position(con, pos)
+            if args.rl:
+                _rl_set_pending(con, state, "hold")
             con.commit()
             print("HOLD (position open)")
             return
@@ -240,13 +418,18 @@ def main():
                     pos["size"] += ADD_SIZE * size_pct
                     pos["last_action_ts"] = price_ts
                     save_position(con, pos)
+                    if args.rl:
+                        _rl_set_pending(con, state, "buy")
                     con.commit()
                     print(f"ADD LONG +{ADD_SIZE} (size={pos['size']})")
                 else:
                     print("LONG at max size")
             else:
                 # close short
-                record_trade(con, "short", pos["size"], pos["entry_price"], pos["entry_ts"], price, price_ts)
+                reward = record_trade(con, "short", pos["size"], pos["entry_price"], pos["entry_ts"], price, price_ts)
+                if args.rl:
+                    next_state = compute_market_state(Path(args.price), "long" if ALLOW_REVERSE else None)
+                    _rl_update(con, reward, next_state)
                 if ALLOW_REVERSE:
                     pos = {
                         "side": "long",
@@ -256,6 +439,8 @@ def main():
                         "last_action_ts": price_ts,
                     }
                     save_position(con, pos)
+                    if args.rl:
+                        _rl_set_pending(con, state, "buy")
                     print("REVERSE to LONG")
                 else:
                     clear_position(con)
@@ -269,13 +454,18 @@ def main():
                     pos["size"] += ADD_SIZE * size_pct
                     pos["last_action_ts"] = price_ts
                     save_position(con, pos)
+                    if args.rl:
+                        _rl_set_pending(con, state, "sell")
                     con.commit()
                     print(f"ADD SHORT +{ADD_SIZE} (size={pos['size']})")
                 else:
                     print("SHORT at max size")
             else:
                 # close long
-                record_trade(con, "long", pos["size"], pos["entry_price"], pos["entry_ts"], price, price_ts)
+                reward = record_trade(con, "long", pos["size"], pos["entry_price"], pos["entry_ts"], price, price_ts)
+                if args.rl:
+                    next_state = compute_market_state(Path(args.price), "short" if ALLOW_REVERSE else None)
+                    _rl_update(con, reward, next_state)
                 if ALLOW_REVERSE:
                     if size_pct < MIN_SIZE_PCT:
                         clear_position(con)
@@ -290,6 +480,8 @@ def main():
                         "last_action_ts": price_ts,
                     }
                     save_position(con, pos)
+                    if args.rl:
+                        _rl_set_pending(con, state, "sell")
                     print("REVERSE to SHORT")
                 else:
                     clear_position(con)

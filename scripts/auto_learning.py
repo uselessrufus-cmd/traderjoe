@@ -2,6 +2,12 @@ import argparse
 import time
 import subprocess
 from pathlib import Path
+import math
+import sys
+from pathlib import Path as _Path
+
+sys.path.append(str((_Path(__file__).resolve().parent)))
+from progress_bar import render_progress
 
 
 def run(cmd):
@@ -18,7 +24,11 @@ def main():
     py = (Path(".python") / "python.exe").resolve()
 
     start = time.time()
+    total_cycles = max(1, int(math.ceil((args.minutes * 60) / max(1, args.cycle))))
+    cycle_idx = 0
     while time.time() - start < args.minutes * 60:
+        cycle_idx += 1
+        print(f"Cycle {cycle_idx}/{total_cycles}")
         # historical simulation + summary
         run([str(py), str(base / "sim_train_loop.py")])
         run([str(py), str(base / "sim_summary.py")])
@@ -32,6 +42,7 @@ def main():
         run([str(py), str(base / "predict_lgbm.py")])
         # adaptive params
         run([str(py), str(base / "adaptive_params.py")])
+        print(f"Overall {render_progress(cycle_idx, total_cycles)}")
         time.sleep(args.cycle)
 
 

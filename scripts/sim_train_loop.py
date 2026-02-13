@@ -10,6 +10,7 @@ from pathlib import Path as _Path
 sys.path.append(str((_Path(__file__).resolve().parent)))
 
 from ml_features import build_features, label_outcomes
+from progress_bar import render_progress
 
 
 def train_eval(df, train_end, test_end, feature_cols):
@@ -93,6 +94,12 @@ def main():
     reports = []
     i = 0
     windows = 0
+    max_possible = 0
+    if len(df) >= args.train_bars + args.test_bars:
+        max_possible = ((len(df) - args.train_bars - args.test_bars) // args.test_bars) + 1
+    total_windows = max_possible
+    if args.max_windows and total_windows > 0:
+        total_windows = min(total_windows, args.max_windows)
     while i + args.train_bars + args.test_bars <= len(df):
         train_end = i + args.train_bars
         test_end = train_end + args.test_bars
@@ -100,6 +107,8 @@ def main():
         reports.append(f"window {i}-{test_end}: acc={acc:.2%} n={n}")
         i += args.test_bars
         windows += 1
+        if total_windows > 0:
+            print(f"Progress {render_progress(windows, total_windows)}")
         # Throttle to reduce CPU usage
         import time
         time.sleep(args.sleep)
