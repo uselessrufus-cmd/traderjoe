@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -134,6 +135,24 @@ def _ts_to_dt(series: pd.Series) -> pd.Series:
     if ts.max() > 10_000_000_000:
         return pd.to_datetime(ts, unit="ms", errors="coerce", utc=True)
     return pd.to_datetime(ts, unit="s", errors="coerce", utc=True)
+
+
+def _render_equity_chart(eq_path: Path, title: str):
+    if not eq_path.exists():
+        st.info(f"Missing file: {eq_path}")
+        return
+    try:
+        eq_df = pd.read_csv(eq_path)
+    except Exception as e:
+        st.warning(f"Could not read equity file: {e}")
+        return
+    if "step" not in eq_df.columns or "equity" not in eq_df.columns or len(eq_df) == 0:
+        st.info("Equity file is empty or invalid.")
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=eq_df["step"], y=eq_df["equity"], mode="lines", name=title))
+    fig.update_layout(template="plotly_dark", height=260, margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def main():
@@ -338,6 +357,20 @@ def main():
         with st.expander("RL Policy (Latest)", expanded=False):
             pol_df = pd.read_csv(rl_policy)
             st.dataframe(pol_df.head(200), use_container_width=True)
+    rl_rationale_summary = _Path("data") / "models" / "rl_rationale_summary.txt"
+    if rl_rationale_summary.exists():
+        with st.expander("RL Rationale Summary", expanded=False):
+            st.code(rl_rationale_summary.read_text(encoding="ascii", errors="ignore").strip(), language="text")
+    rl_rationale_assessment = _Path("data") / "models" / "rl_rationale_assessment.csv"
+    if rl_rationale_assessment.exists():
+        with st.expander("RL Rationale Assessment", expanded=False):
+            rdf = pd.read_csv(rl_rationale_assessment)
+            st.dataframe(rdf.head(100), use_container_width=True)
+    rl_rationale_memory = _Path("data") / "models" / "rl_rationale_memory.csv"
+    if rl_rationale_memory.exists():
+        with st.expander("RL Rationale Memory", expanded=False):
+            mdf = pd.read_csv(rl_rationale_memory)
+            st.dataframe(mdf.head(100), use_container_width=True)
     rl_eq = _Path("data") / "models" / "rl_test_equity.csv"
     if rl_eq.exists():
         with st.expander("RL Test Equity Curve", expanded=False):
@@ -372,6 +405,138 @@ def main():
         with st.expander("RL Strategy Recheck (Top)", expanded=False):
             rchk_df = pd.read_csv(rl_recheck)
             st.dataframe(rchk_df.head(50), use_container_width=True)
+    rl_champions = _Path("data") / "models" / "rl_champions.csv"
+    if rl_champions.exists():
+        with st.expander("RL Champions", expanded=False):
+            cdf = pd.read_csv(rl_champions)
+            st.dataframe(cdf, use_container_width=True)
+    rl_champions_summary = _Path("data") / "models" / "rl_champions_summary.txt"
+    if rl_champions_summary.exists():
+        with st.expander("RL Champions Summary", expanded=False):
+            st.code(rl_champions_summary.read_text(encoding="ascii", errors="ignore").strip(), language="text")
+    fee_root = _Path("data") / "models" / "fee_ladder"
+    if fee_root.exists():
+        with st.expander("RL Fee Ladder (Candidates + Champions)", expanded=False):
+            fee_status = fee_root / "rl_self_train_status.txt"
+            fee_summary = fee_root / "rl_champions_summary.txt"
+            fee_champions = fee_root / "rl_champions.csv"
+            fee_recheck = fee_root / "rl_strategy_recheck.csv"
+
+            cols = st.columns(2)
+            with cols[0]:
+                if fee_status.exists():
+                    st.caption("Fee Ladder Status")
+                    st.code(fee_status.read_text(encoding="ascii", errors="ignore").strip(), language="text")
+            with cols[1]:
+                if fee_summary.exists():
+                    st.caption("Fee Ladder Champions Summary")
+                    st.code(fee_summary.read_text(encoding="ascii", errors="ignore").strip(), language="text")
+
+            if fee_champions.exists():
+                cdf = pd.read_csv(fee_champions)
+                st.caption("Fee Ladder Champions")
+                st.dataframe(cdf, use_container_width=True)
+
+            if fee_recheck.exists():
+                rdf = pd.read_csv(fee_recheck)
+                st.caption("Fee Ladder Recheck (Top)")
+                st.dataframe(rdf.head(30), use_container_width=True)
+
+            st.caption("Equity Curves")
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.markdown("**Champion Equity Curve**")
+                champ_eq_map = {}
+                for regime in ("global", "bull", "bear", "range"):
+                    p = fee_root / "champions" / regime / "test_equity.csv"
+                    if p.exists():
+                        champ_eq_map[regime] = p
+                if len(champ_eq_map) == 0:
+                    st.info("No champion equity curves yet.")
+                else:
+                    regime = st.selectbox(
+                        "Champion regime",
+                        options=list(champ_eq_map.keys()),
+                        index=0,
+                        key="fee_champion_regime",
+                    )
+                    _render_equity_chart(champ_eq_map[regime], f"Champion {regime}")
+
+            with c2:
+                st.markdown("**Candidate Equity Curve**")
+                cand_files = sorted(
+                    fee_root.glob("_candidate_snapshots/round_*/cand_*/profile_*/test_equity.csv"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if len(cand_files) == 0:
+                    st.info("No candidate equity curves yet.")
+                else:
+                    labels = []
+                    for p in cand_files[:100]:
+                        try:
+                            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        except Exception:
+                            mtime = "unknown"
+                        labels.append(f"{mtime} | {p.relative_to(fee_root)}")
+                    selected = st.selectbox(
+                        "Candidate run",
+                        options=labels,
+                        index=0,
+                        key="fee_candidate_curve",
+                    )
+                    selected_idx = labels.index(selected)
+                    _render_equity_chart(cand_files[selected_idx], "Candidate")
+
+    exp_index = _Path("data") / "models" / "experiments" / "index.csv"
+    if exp_index.exists():
+        with st.expander("Experiment Tracking", expanded=False):
+            try:
+                exp_df = pd.read_csv(exp_index)
+                if len(exp_df) == 0:
+                    st.info("No experiment runs logged yet.")
+                else:
+                    show_cols = [
+                        c
+                        for c in [
+                            "created_at_utc",
+                            "run_id",
+                            "source",
+                            "mode",
+                            "objective",
+                            "test_return",
+                            "test_dd",
+                            "win_rate",
+                            "tag",
+                            "parent_run_id",
+                        ]
+                        if c in exp_df.columns
+                    ]
+                    st.caption(f"Total runs: {len(exp_df)}")
+                    st.dataframe(exp_df[show_cols].tail(50).iloc[::-1], use_container_width=True)
+                    latest = exp_df.iloc[-1]
+                    run_dir = _Path(str(latest.get("run_dir", "")))
+                    if run_dir.exists():
+                        mpath = run_dir / "metrics.json"
+                        ppath = run_dir / "params.json"
+                        meta = run_dir / "metadata.json"
+                        cols = st.columns(3)
+                        cols[0].write(f"Latest run: `{latest.get('run_id', '')}`")
+                        cols[1].write(f"Mode: `{latest.get('mode', '')}`")
+                        cols[2].write(f"Source: `{latest.get('source', '')}`")
+                        if mpath.exists():
+                            cols2 = st.columns(2)
+                            cols2[0].code(mpath.read_text(encoding="ascii", errors="ignore").strip(), language="json")
+                        if ppath.exists():
+                            cols2 = st.columns(2)
+                            cols2[1].code(ppath.read_text(encoding="ascii", errors="ignore").strip(), language="json")
+                        if meta.exists():
+                            meta_obj = json.loads(meta.read_text(encoding="ascii", errors="ignore"))
+                            st.write("Artifacts")
+                            st.json(meta_obj.get("artifacts", {}))
+            except Exception as e:
+                st.warning(f"Could not read experiment index: {e}")
 
     trades_csv = _Path("data") / "models" / "historical_sim_trades.csv"
     preds_csv = _Path("data") / "models" / "historical_sim_predictions.csv"

@@ -17,7 +17,7 @@ def main():
         # update ML signal
         subprocess.run([str(py), str(base / "predict_lgbm.py")], check=False)
         # execute paper trade step with online RL enabled
-        subprocess.run([str(py), str(base / "paper_trade.py"), "--rl"], check=False)
+        subprocess.run([str(py), str(base / "paper_trade.py"), "--rl", "--champions"], check=False)
         time.sleep(args.every)
 
 

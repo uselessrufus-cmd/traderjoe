@@ -13,6 +13,15 @@ from signal_engine import build_signals
 from progress_bar import render_progress
 
 
+def fmt_strategy_line(r: pd.Series) -> str:
+    return (
+        f"- mfi={int(r.mfi_lower)}/{int(r.mfi_upper)} ob={int(r.ob_lookback)} trend={bool(r.trend_filter)} "
+        f"dca={bool(r.dca)} mg={r.martingale} dca_atr={r.dca_atr} st_tp={bool(r.stagger_tp)} "
+        f"sl_atr={r.sl_atr} tp_atr={r.tp_atr} tp1={r.tp1_atr} tp2={r.tp2_atr} "
+        f"win={r.win_rate:.2%} avg={r.avg_trade:.2%} dd={r.max_dd:.2%} ret={r.total_ret:.2%} score={r.score:.4f}"
+    )
+
+
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -175,6 +184,9 @@ def main():
     p.add_argument("--max-combos", type=int, default=0)
     p.add_argument("--sleep", type=float, default=0.0)
     p.add_argument("--max-leverage", type=float, default=1.0)
+    p.add_argument("--min-total-ret", type=float, default=-0.99)
+    p.add_argument("--min-max-dd", type=float, default=-0.99)
+    p.add_argument("--min-trades", type=int, default=20)
     args = p.parse_args()
 
     df = pd.read_csv(args.input)
@@ -265,29 +277,51 @@ def main():
     df_out = pd.DataFrame(rows).sort_values("score", ascending=False)
     df_out.to_csv(out, index=False)
 
-    best = df_out.iloc[0]
-    worst = df_out.iloc[-1]
+    viable_mask = (
+        np.isfinite(df_out["score"])
+        & np.isfinite(df_out["total_ret"])
+        & np.isfinite(df_out["max_dd"])
+        & (df_out["trades"] >= args.min_trades)
+        & (df_out["total_ret"] > args.min_total_ret)
+        & (df_out["max_dd"] > args.min_max_dd)
+    )
+    df_viable = df_out[viable_mask].sort_values("score", ascending=False)
 
-    top5 = df_out.head(5)
+    if df_viable.empty:
+        raw_top = df_out.head(5)
+        raw_lines = []
+        for _, r in raw_top.iterrows():
+            raw_lines.append(fmt_strategy_line(r))
+        summary = (
+            "No viable strategies found\n"
+            f"Criteria: trades>={args.min_trades}, total_ret>{args.min_total_ret:.2%}, "
+            f"max_dd>{args.min_max_dd:.2%}, finite score/max_dd/total_ret\n\n"
+            "Top 5 raw strategies (debug)\n" + "\n".join(raw_lines) + "\n"
+        )
+        Path(args.summary).write_text(summary, encoding="ascii")
+        print(summary)
+        print("Skipped writing data/models/best_strategy.txt because no viable strategy passed filters.")
+        return
+
+    best = df_viable.iloc[0]
+    worst = df_viable.iloc[-1]
+
+    top5 = df_viable.head(5)
     top_lines = []
     for _, r in top5.iterrows():
-        top_lines.append(
-            f"- mfi={int(r.mfi_lower)}/{int(r.mfi_upper)} ob={int(r.ob_lookback)} trend={bool(r.trend_filter)} "
-            f"dca={bool(r.dca)} mg={r.martingale} st_tp={bool(r.stagger_tp)} "
-            f"sl_atr={r.sl_atr} tp_atr={r.tp_atr} tp1={r.tp1_atr} tp2={r.tp2_atr} "
-            f"win={r.win_rate:.2%} avg={r.avg_trade:.2%} dd={r.max_dd:.2%} ret={r.total_ret:.2%}"
-        )
+        top_lines.append(fmt_strategy_line(r))
 
     summary = (
+        f"Viable strategies: {len(df_viable)}/{len(df_out)}\n\n"
         "Best strategy\n"
         f"mfi_lower={best.mfi_lower} mfi_upper={best.mfi_upper} ob_lookback={best.ob_lookback} trend={best.trend_filter} dca={best.dca} mg={best.martingale}\n"
         f"sl_atr={best.sl_atr} tp_atr={best.tp_atr} tp1={best.tp1_atr} tp2={best.tp2_atr} st_tp={best.stagger_tp} trades={best.trades}\n"
-        f"win={best.win_rate:.2%} avg={best.avg_trade:.2%} dd={best.max_dd:.2%} ret={best.total_ret:.2%}\n\n"
+        f"win={best.win_rate:.2%} avg={best.avg_trade:.2%} dd={best.max_dd:.2%} ret={best.total_ret:.2%} score={best.score:.4f}\n\n"
         "Top 5 strategies\n" + "\n".join(top_lines) + "\n\n"
         "Worst strategy\n"
         f"mfi_lower={worst.mfi_lower} mfi_upper={worst.mfi_upper} ob_lookback={worst.ob_lookback} trend={worst.trend_filter} dca={worst.dca} mg={worst.martingale}\n"
         f"sl_atr={worst.sl_atr} tp_atr={worst.tp_atr} tp1={worst.tp1_atr} tp2={worst.tp2_atr} st_tp={worst.stagger_tp} trades={worst.trades}\n"
-        f"win={worst.win_rate:.2%} avg={worst.avg_trade:.2%} dd={worst.max_dd:.2%} ret={worst.total_ret:.2%}\n"
+        f"win={worst.win_rate:.2%} avg={worst.avg_trade:.2%} dd={worst.max_dd:.2%} ret={worst.total_ret:.2%} score={worst.score:.4f}\n"
     )
 
     Path(args.summary).write_text(summary, encoding="ascii")

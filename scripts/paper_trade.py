@@ -8,6 +8,7 @@ import sys
 from pathlib import Path as _Path
 
 sys.path.append(str((_Path(__file__).resolve().parent)))
+from ml_features import build_features
 
 # Simple paper trader config
 BASE_SIZE = 1.0
@@ -76,6 +77,71 @@ def compute_market_state(csv_path: Path, pos_side: str | None) -> str:
     vol_bucket = "highvol" if vol_val > 0.02 else "lowvol"
     side_bucket = pos_side if pos_side in {"long", "short"} else "none"
     return f"{trend}:{mom_bucket}|{vol_bucket}|{side_bucket}"
+
+
+def _bucket_mfi(v: float) -> str:
+    if v < 30:
+        return "low"
+    if v > 70:
+        return "high"
+    return "mid"
+
+
+def _bucket_macd(v: float) -> str:
+    return "up" if v >= 0 else "down"
+
+
+def compute_policy_state(csv_path: Path, pos_side: str | None) -> str:
+    try:
+        df = pd.read_csv(csv_path)
+        df.columns = [c.lower() for c in df.columns]
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
+        feat = build_features(df).dropna().reset_index(drop=True)
+        if len(feat) == 0:
+            side_bucket = pos_side if pos_side in {"long", "short"} else "none"
+            return f"range|mfi:mid|macd:down|ob:mix|pos:{side_bucket}"
+        row = feat.iloc[-1]
+        trend = "bull" if int(row.get("trend_up", 0)) == 1 else "bear"
+        mfi = _bucket_mfi(float(row.get("mfi_14", 50.0)))
+        macd = _bucket_macd(float(row.get("macd_hist", 0.0)))
+        ob_bull = int(row.get("ob_bull_recent", 0))
+        ob_bear = int(row.get("ob_bear_recent", 0))
+        ob = "bull" if ob_bull and not ob_bear else "bear" if ob_bear and not ob_bull else "mix"
+        side_bucket = pos_side if pos_side in {"long", "short"} else "none"
+        return f"{trend}|mfi:{mfi}|macd:{macd}|ob:{ob}|pos:{side_bucket}"
+    except Exception:
+        side_bucket = pos_side if pos_side in {"long", "short"} else "none"
+        return f"range|mfi:mid|macd:down|ob:mix|pos:{side_bucket}"
+
+
+def select_champion_action(policy_state: str, champions_root: Path) -> tuple[str, str]:
+    regime = str(policy_state).split("|", 1)[0]
+    order = []
+    if regime in {"bull", "bear", "range"}:
+        order.append(regime)
+    order.append("global")
+    for reg in order:
+        pol = champions_root / reg / "policy.csv"
+        if not pol.exists():
+            continue
+        try:
+            pdf = pd.read_csv(pol)
+            if len(pdf) == 0 or "state" not in pdf.columns or "action" not in pdf.columns:
+                continue
+            exact = pdf[pdf["state"] == policy_state]
+            if not exact.empty:
+                return str(exact.iloc[0]["action"]).lower(), f"champion:{reg}:exact"
+            # fallback: same rationale context, different position side
+            if "|pos:" in policy_state:
+                rk = policy_state.split("|pos:", 1)[0] + "|pos:"
+                cands = pdf[pdf["state"].astype(str).str.startswith(rk)]
+                if not cands.empty:
+                    if "q" in cands.columns:
+                        cands = cands.sort_values("q", ascending=False)
+                    return str(cands.iloc[0]["action"]).lower(), f"champion:{reg}:context"
+        except Exception:
+            continue
+    return "hold", "none"
 
 
 def get_signal(signal_file: Path, fallback_csv: Path):
@@ -291,13 +357,30 @@ def _rl_update(con, reward: float, next_state: str):
     _rl_clear_pending(con)
 
 
-def _write_rl_status(path: Path, enabled: bool, state: str, base_signal: str, rl_signal: str, final_signal: str, mode: str, updates: int):
+def _write_rl_status(
+    path: Path,
+    enabled: bool,
+    state: str,
+    base_signal: str,
+    rl_signal: str,
+    final_signal: str,
+    mode: str,
+    updates: int,
+    champion_enabled: bool = False,
+    champion_signal: str = "",
+    champion_source: str = "",
+    policy_state: str = "",
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         (
             f"enabled={enabled}\n"
             f"state={state}\n"
+            f"policy_state={policy_state}\n"
             f"base_signal={base_signal}\n"
+            f"champion_enabled={champion_enabled}\n"
+            f"champion_signal={champion_signal}\n"
+            f"champion_source={champion_source}\n"
             f"rl_signal={rl_signal}\n"
             f"final_signal={final_signal}\n"
             f"mode={mode}\n"
@@ -317,6 +400,8 @@ def main():
     p.add_argument("--signal", default="data/models/lgbm_latest_signal.txt")
     p.add_argument("--db", default="data/paper_trades.db")
     p.add_argument("--rl", action="store_true")
+    p.add_argument("--champions", action="store_true")
+    p.add_argument("--champions-root", default="data/models/champions")
     p.add_argument("--epsilon", type=float, default=RL_EPSILON)
     p.add_argument("--warmup-updates", type=int, default=RL_WARMUP)
     p.add_argument("--rl-status", default="data/models/rl_status.txt")
@@ -338,9 +423,10 @@ def main():
         for line in best_path.read_text(encoding="ascii", errors="ignore").splitlines():
             pass
 
-    price_ts, price = get_latest_price(Path(args.price))
-    size_pct = compute_position_size(Path(args.price))
-    base_signal = get_signal(Path(args.signal), Path(args.price))
+    price_path = Path(args.price)
+    price_ts, price = get_latest_price(price_path)
+    size_pct = compute_position_size(price_path)
+    base_signal = get_signal(Path(args.signal), price_path)
 
     db_path = Path(args.db)
     init_db(db_path)
@@ -348,14 +434,35 @@ def main():
     with sqlite3.connect(db_path) as con:
         pos = load_position(con)
         state = compute_market_state(Path(args.price), pos["side"] if pos else None)
-        signal = base_signal
-        rl_signal = base_signal
+        policy_state = compute_policy_state(price_path, pos["side"] if pos else None)
+        champion_signal = ""
+        champion_source = "disabled"
+        model_signal = base_signal
+        if args.champions:
+            champion_signal, champion_source = select_champion_action(policy_state, Path(args.champions_root))
+            if champion_source != "none":
+                model_signal = champion_signal
+        signal = model_signal
+        rl_signal = model_signal
         mode = "disabled"
         updates = _rl_get_total_updates(con)
         if args.rl:
-            rl_signal, updates, mode = _rl_choose_action(con, state, base_signal, args.epsilon, args.warmup_updates)
+            rl_signal, updates, mode = _rl_choose_action(con, state, model_signal, args.epsilon, args.warmup_updates)
             signal = rl_signal
-        _write_rl_status(Path(args.rl_status), args.rl, state, base_signal, rl_signal, signal, mode, updates)
+        _write_rl_status(
+            Path(args.rl_status),
+            args.rl,
+            state,
+            base_signal,
+            rl_signal,
+            signal,
+            mode,
+            updates,
+            champion_enabled=args.champions,
+            champion_signal=champion_signal,
+            champion_source=champion_source,
+            policy_state=policy_state,
+        )
 
         # avoid duplicate action on same timestamp
         if pos and pos.get("last_action_ts") == price_ts:
@@ -367,9 +474,10 @@ def main():
                 if size_pct < MIN_SIZE_PCT:
                     print("SKIP BUY (size too small)")
                     return
+                size = BASE_SIZE * size_pct
                 pos = {
                     "side": "long",
-                    "size": BASE_SIZE * size_pct,
+                    "size": size,
                     "entry_price": price,
                     "entry_ts": price_ts,
                     "last_action_ts": price_ts,
@@ -378,14 +486,15 @@ def main():
                 if args.rl:
                     _rl_set_pending(con, state, "buy")
                 con.commit()
-                print(f"OPEN LONG {BASE_SIZE} @ {price}")
+                print(f"OPEN LONG {size:.4f} @ {price}")
             elif signal == "sell":
                 if size_pct < MIN_SIZE_PCT:
                     print("SKIP SELL (size too small)")
                     return
+                size = BASE_SIZE * size_pct
                 pos = {
                     "side": "short",
-                    "size": BASE_SIZE * size_pct,
+                    "size": size,
                     "entry_price": price,
                     "entry_ts": price_ts,
                     "last_action_ts": price_ts,
@@ -394,7 +503,7 @@ def main():
                 if args.rl:
                     _rl_set_pending(con, state, "sell")
                 con.commit()
-                print(f"OPEN SHORT {BASE_SIZE} @ {price}")
+                print(f"OPEN SHORT {size:.4f} @ {price}")
             else:
                 if args.rl:
                     _rl_set_pending(con, state, "hold")
@@ -414,14 +523,15 @@ def main():
 
         if signal == "buy":
             if side == "long":
-                if pos["size"] + ADD_SIZE <= MAX_SIZE:
-                    pos["size"] += ADD_SIZE * size_pct
+                add_size = ADD_SIZE * size_pct
+                if pos["size"] + add_size <= MAX_SIZE:
+                    pos["size"] += add_size
                     pos["last_action_ts"] = price_ts
                     save_position(con, pos)
                     if args.rl:
                         _rl_set_pending(con, state, "buy")
                     con.commit()
-                    print(f"ADD LONG +{ADD_SIZE} (size={pos['size']})")
+                    print(f"ADD LONG +{add_size:.4f} (size={pos['size']:.4f})")
                 else:
                     print("LONG at max size")
             else:
@@ -431,9 +541,15 @@ def main():
                     next_state = compute_market_state(Path(args.price), "long" if ALLOW_REVERSE else None)
                     _rl_update(con, reward, next_state)
                 if ALLOW_REVERSE:
+                    if size_pct < MIN_SIZE_PCT:
+                        clear_position(con)
+                        con.commit()
+                        print("CLOSE SHORT (size too small to reverse)")
+                        return
+                    size = BASE_SIZE * size_pct
                     pos = {
                         "side": "long",
-                        "size": BASE_SIZE,
+                        "size": size,
                         "entry_price": price,
                         "entry_ts": price_ts,
                         "last_action_ts": price_ts,
@@ -441,7 +557,7 @@ def main():
                     save_position(con, pos)
                     if args.rl:
                         _rl_set_pending(con, state, "buy")
-                    print("REVERSE to LONG")
+                    print(f"REVERSE to LONG (size={size:.4f})")
                 else:
                     clear_position(con)
                     print("CLOSE SHORT")
@@ -450,14 +566,15 @@ def main():
 
         if signal == "sell":
             if side == "short":
-                if pos["size"] + ADD_SIZE <= MAX_SIZE:
-                    pos["size"] += ADD_SIZE * size_pct
+                add_size = ADD_SIZE * size_pct
+                if pos["size"] + add_size <= MAX_SIZE:
+                    pos["size"] += add_size
                     pos["last_action_ts"] = price_ts
                     save_position(con, pos)
                     if args.rl:
                         _rl_set_pending(con, state, "sell")
                     con.commit()
-                    print(f"ADD SHORT +{ADD_SIZE} (size={pos['size']})")
+                    print(f"ADD SHORT +{add_size:.4f} (size={pos['size']:.4f})")
                 else:
                     print("SHORT at max size")
             else:
@@ -472,9 +589,10 @@ def main():
                         con.commit()
                         print("CLOSE LONG (size too small to reverse)")
                         return
+                    size = BASE_SIZE * size_pct
                     pos = {
                         "side": "short",
-                        "size": BASE_SIZE * size_pct,
+                        "size": size,
                         "entry_price": price,
                         "entry_ts": price_ts,
                         "last_action_ts": price_ts,
@@ -482,7 +600,7 @@ def main():
                     save_position(con, pos)
                     if args.rl:
                         _rl_set_pending(con, state, "sell")
-                    print("REVERSE to SHORT")
+                    print(f"REVERSE to SHORT (size={size:.4f})")
                 else:
                     clear_position(con)
                     print("CLOSE LONG")

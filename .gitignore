@@ -8,3 +8,4 @@ bitunixtraderjoeapi.txt
 *.log
 python-*-embed-*.zip
 .env
+traderjoe-push.txt
